@@ -1,0 +1,24 @@
+python3 src/train_infer/train.py \
+    --dataset simple \
+    --train_txt_path data/simple/simple.txt \
+    --val_txt_path data/simple/simple.txt \
+    --checkpoint_path checkpoints/simple \
+    --batch_size 4 \
+    --sequence_len 64 \
+    --num_channels 128 \
+    --num_heads 4 \
+    --dropout 0.1 \
+    --diffusion_steps 100 \
+    --noise_schedule cosine \
+    --lr 1e-4 \
+    --weight_decay 0.0 \
+    --save_interval 10 \
+    --log_interval 10 \
+    --eval_interval 50 \
+    --model_arch transformer \
+    --training_mode e2e \
+    --use_pretrained_embeddings False \
+    --init_pretrained False \
+    --freeze_embeddings False \
+    --seed 42 \
+    --debug 

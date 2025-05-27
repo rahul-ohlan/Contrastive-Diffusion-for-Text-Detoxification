@@ -29,6 +29,7 @@ def create_argparser():
         val_txt_path="data/quotes_valid.txt",
         dataset="",
         notes="",
+        use_wandb=False,  # Add wandb flag with default False
     )
     text_defaults = dict(
         modality="text",

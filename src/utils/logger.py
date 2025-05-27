@@ -366,8 +366,11 @@ class Logger(object):
             )
             if self.comm.rank != 0:
                 d["dummy"] = 1  # so we don't get a warning about empty dict
-        # LISA
-        wandb.log({**d})
+        
+        # Only log to wandb from rank 0
+        if (self.comm is None or self.comm.rank == 0) and wandb.run is not None:
+            wandb.log(d)
+            
         out = d.copy()  # Return the dict for unit testing purposes
         for fmt in self.output_formats:
             if isinstance(fmt, KVWriter):
@@ -404,42 +407,15 @@ class Logger(object):
 
 
 def get_rank_without_mpi_import():
-    # check environment variables here instead of importing mpi4py
-    # to avoid calling MPI_Init() when this module is imported
-    for varname in ["PMI_RANK", "OMPI_COMM_WORLD_RANK"]:
-        if varname in os.environ:
-            return int(os.environ[varname])
+    # Simplified version that always returns 0 since we're not using MPI
     return 0
 
 
 def mpi_weighted_mean(comm, local_name2valcount):
-    """
-    Copied from: https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/common/mpi_util.py#L110
-    Perform a weighted average over dicts that are each on a different node
-    Input: local_name2valcount: dict mapping key -> (value, count)
-    Returns: key -> mean
-    """
-    all_name2valcount = comm.gather(local_name2valcount)
-    if comm.rank == 0:
-        name2sum = defaultdict(float)
-        name2count = defaultdict(float)
-        for n2vc in all_name2valcount:
-            for (name, (val, count)) in n2vc.items():
-                try:
-                    val = float(val)
-                except ValueError:
-                    if comm.rank == 0:
-                        warnings.warn(
-                            "WARNING: tried to compute mean on non-float {}={}".format(
-                                name, val
-                            )
-                        )
-                else:
-                    name2sum[name] += val * count
-                    name2count[name] += count
-        return {name: name2sum[name] / name2count[name] for name in name2sum}
-    else:
-        return {}
+    # Simplified version that just returns the local values since we're not using MPI
+    name2sum = {name: val * count for name, (val, count) in local_name2valcount.items()}
+    name2count = {name: count for name, (_, count) in local_name2valcount.items()}
+    return {name: name2sum[name] / name2count[name] for name in name2sum.keys()}
 
 
 def configure(dir=None, format_strs=None, comm=None, log_suffix=""):

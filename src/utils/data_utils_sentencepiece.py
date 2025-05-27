@@ -1,9 +1,11 @@
 import logging
 import torch
 import pandas as pd
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 import torch
 from functools import partial
+import torch.distributed as dist
+from src.utils import dist_util  # Use our own dist_util module
 
 logging.basicConfig(level=logging.INFO)
 
@@ -15,17 +17,30 @@ logging.basicConfig(level=logging.INFO)
 
 def get_dataloader(tokenizer, data_path, batch_size, max_seq_len):
     dataset = TextDataset(tokenizer=tokenizer, data_path=data_path)
+    
+    # Set up distributed sampler if using DDP
+    sampler = None
+    if dist.is_initialized():
+        sampler = DistributedSampler(dataset, shuffle=True)
+        # Adjust batch size per GPU
+        batch_size = batch_size // dist.get_world_size()
+        logging.info(f"Using distributed sampler. Adjusted batch size per GPU: {batch_size}")
 
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,  # 20,
+        batch_size=batch_size,
         drop_last=True,
-        shuffle=True,
-        num_workers=1,
+        shuffle=(sampler is None),  # Don't shuffle if using sampler
+        num_workers=0,  # Disable multiprocessing to avoid pickling issues
+        pin_memory=True,  # Better performance with CUDA
+        sampler=sampler,
         collate_fn=partial(TextDataset.collate_pad, cutoff=max_seq_len),
     )
 
     while True:
+        # Set epoch for proper shuffling
+        if sampler is not None:
+            sampler.set_epoch(dist_util.get_rank())
         for batch in dataloader:
             yield batch
 

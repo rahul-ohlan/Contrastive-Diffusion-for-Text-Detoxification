@@ -1,3 +1,7 @@
+"""
+Training loop for single GPU training.
+"""
+
 import copy
 import functools
 import os
@@ -5,13 +9,9 @@ import os
 import blobfile as bf
 import numpy as np
 import torch as th
-import torch.distributed as dist
-from torch.nn.parallel.distributed import DistributedDataParallel as DDP
-from torch.optim import AdamW
-from tqdm import tqdm
 import wandb
 
-from src.utils import dist_util, logger
+from src.utils import logger
 from src.utils.fp16_util import (
     make_master_params,
     master_params_to_model_params,
@@ -21,7 +21,6 @@ from src.utils.fp16_util import (
 )
 from src.modeling.diffusion.nn import update_ema
 from src.modeling.diffusion.resample import LossAwareSampler, UniformSampler
-
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -72,14 +71,11 @@ class TrainLoop:
         self.gradient_clipping = gradient_clipping
         self.step = 0
         self.resume_step = 0
-        self.global_batch = self.batch_size # * dist.get_world_size()
+        self.global_batch = self.batch_size
         self.use_wandb = use_wandb
         self.checkpoint_path = checkpoint_path
         self.eval_data = eval_data
         self.eval_interval = eval_interval
-        self.is_rank_0 = dist_util.get_rank() == 0
-
-        self.sync_cuda = th.cuda.is_available()
 
         self.model_params = list(self.model.parameters())
         self.master_params = self.model_params
@@ -89,25 +85,8 @@ class TrainLoop:
         if self.use_fp16:
             self._setup_fp16()
 
-        self.opt = AdamW(self.master_params, lr=self.lr, weight_decay=self.weight_decay)
-
-        if th.cuda.is_available():
-            self.use_ddp = True
-            if not isinstance(self.model, DDP):  # Only wrap in DDP if not already wrapped
-                self.ddp_model = DDP(
-                    self.model,
-                    device_ids=[dist_util.dev()],
-                    output_device=dist_util.dev(),
-                    broadcast_buffers=False,
-                    bucket_cap_mb=128,
-                    find_unused_parameters=False,
-                )
-            else:
-                self.ddp_model = self.model
-        else:
-            self.use_ddp = False
-            self.ddp_model = self.model
-
+        self.opt = th.optim.AdamW(self.master_params, lr=self.lr, weight_decay=self.weight_decay)
+        
         if self.resume_step:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
@@ -120,11 +99,6 @@ class TrainLoop:
                 copy.deepcopy(self.master_params) for _ in range(len(self.ema_rate))
             ]
 
-        # Initialize wandb only on rank 0
-        if self.is_rank_0 and self.use_wandb:
-            if not wandb.run:
-                wandb.init(project="minimal-text-diffusion", entity="cb-solo")
-
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
 
@@ -132,8 +106,8 @@ class TrainLoop:
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
             logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
             self.model.load_state_dict(
-                dist_util.load_state_dict(
-                    resume_checkpoint, map_location=dist_util.dev()
+                th.load(
+                    resume_checkpoint, map_location=next(self.model.parameters()).device
                 )
             )
 
@@ -144,8 +118,8 @@ class TrainLoop:
         ema_checkpoint = find_ema_checkpoint(main_checkpoint, self.resume_step, rate)
         if ema_checkpoint:
             logger.log(f"loading EMA from checkpoint: {ema_checkpoint}...")
-            state_dict = dist_util.load_state_dict(
-                ema_checkpoint, map_location=dist_util.dev()
+            state_dict = th.load(
+                ema_checkpoint, map_location=next(self.model.parameters()).device
             )
             ema_params = self._state_dict_to_master_params(state_dict)
 
@@ -158,8 +132,8 @@ class TrainLoop:
         )
         if bf.exists(opt_checkpoint):
             logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
-            state_dict = dist_util.load_state_dict(
-                opt_checkpoint, map_location=dist_util.dev()
+            state_dict = th.load(
+                opt_checkpoint, map_location=next(self.model.parameters()).device
             )
             self.opt.load_state_dict(state_dict)
 
@@ -168,9 +142,8 @@ class TrainLoop:
         self.model.convert_to_fp16()
 
     def run_loop(self):
-        is_rank_0 = dist_util.get_rank() == 0
-        if is_rank_0:
-            pbar = tqdm(total=self.lr_anneal_steps, desc="Training")
+        from tqdm import tqdm
+        pbar = tqdm(total=self.lr_anneal_steps, desc="Training")
             
         while (
             not self.lr_anneal_steps
@@ -184,14 +157,10 @@ class TrainLoop:
                 
             self.run_step(batch, cond)
             
-            if is_rank_0 and self.step % self.log_interval == 0:
+            if self.step % self.log_interval == 0:
                 logger.dumpkvs()
                 
             if self.eval_data is not None and self.step % self.eval_interval == 0:
-                # Synchronize before evaluation
-                if dist_util.get_world_size() > 1:
-                    dist.barrier()
-                    
                 _, batch_eval_dict = next(self.eval_data)
                 batch_eval = batch_eval_dict["input_ids"]
                 cond_eval = {"input_ids": batch_eval_dict["input_ids"]}
@@ -199,32 +168,16 @@ class TrainLoop:
                     cond_eval["attention_mask"] = batch_eval_dict["attention_mask"]
                     
                 self.forward_only(batch_eval, cond_eval)
-                if is_rank_0:
-                    print('eval on validation set')
-                    logger.dumpkvs()
+                print('eval on validation set')
+                logger.dumpkvs()
                     
             if self.step % self.save_interval == 0:
-                # Synchronize before saving
-                if dist_util.get_world_size() > 1:
-                    dist.barrier()
-                if is_rank_0:
-                    self.save()
-                    
-                # Run for a finite amount of time in integration tests.
-                if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
-                    return
+                self.save()
                     
             self.step += 1
-            if is_rank_0:
-                pbar.update(1)
+            pbar.update(1)
                 
-        # Save final checkpoint at the end of training
-        if is_rank_0:
-            pbar.close()
-            logger.log("Training completed. Saving final checkpoint...")
-            if dist_util.get_world_size() > 1:
-                dist.barrier()
-            self.save()
+        pbar.close()
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
@@ -239,56 +192,48 @@ class TrainLoop:
         with th.no_grad():
             zero_grad(self.model_params)
             for i in range(0, batch.shape[0], self.microbatch):
-                micro = batch[i : i + self.microbatch].to(dist_util.dev())
+                micro = batch[i : i + self.microbatch].to(next(self.model.parameters()).device)
                 micro_cond = {
-                    k: v[i : i + self.microbatch].to(dist_util.dev())
+                    k: v[i : i + self.microbatch].to(next(self.model.parameters()).device)
                     for k, v in cond.items()
                 }
                 last_batch = (i + self.microbatch) >= batch.shape[0]
-                t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+                t, weights = self.schedule_sampler.sample(micro.shape[0], next(self.model.parameters()).device)
+
                 compute_losses = functools.partial(
                     self.diffusion.training_losses,
-                    self.ddp_model,
+                    self.model,
                     micro,
                     t,
                     model_kwargs=micro_cond,
                 )
 
-                if last_batch or not self.use_ddp:
-                    losses = compute_losses()
-                else:
-                    with self.ddp_model.no_sync():
-                        losses = compute_losses()
+                losses = compute_losses()
 
                 log_loss_dict(
-                    self.diffusion, t, {k: v * weights for k, v in losses.items()},
-                    step=self.step + self.resume_step
+                    self.diffusion, t, {k: v * weights for k, v in losses.items()}
                 )
 
     def forward_backward(self, batch, cond):
         zero_grad(self.model_params)
         for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
+            micro = batch[i : i + self.microbatch].to(next(self.model.parameters()).device)
             micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
+                k: v[i : i + self.microbatch].to(next(self.model.parameters()).device)
                 for k, v in cond.items()
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            t, weights = self.schedule_sampler.sample(micro.shape[0], next(self.model.parameters()).device)
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
-                self.ddp_model,
+                self.model,
                 micro,
                 t,
                 model_kwargs=micro_cond,
             )
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
-            else:
-                with self.ddp_model.no_sync():
-                    losses = compute_losses()
+            losses = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
@@ -297,8 +242,7 @@ class TrainLoop:
 
             loss = (losses["loss"] * weights).mean()
             log_loss_dict(
-                self.diffusion, t, {k: v * weights for k, v in losses.items()},
-                step=self.step + self.resume_step
+                self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
             if self.use_fp16:
                 loss = loss * self.fp16_scale
@@ -319,7 +263,6 @@ class TrainLoop:
         self.lg_loss_scale += self.fp16_scale_growth
 
     def grad_clip(self):
-        # print('doing gradient clipping')
         max_grad_norm=self.gradient_clipping
         if hasattr(self.opt, "clip_grad_norm"):
             # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
@@ -353,21 +296,19 @@ class TrainLoop:
             param_group["lr"] = lr
 
     def log_step(self):
-        step = self.step + self.resume_step
-        if self.is_rank_0:  # Only log on rank 0
-            logger.logkv("step", step)
-            logger.logkv("samples", (step + 1) * self.global_batch)
+        logger.logkv("step", self.step + self.resume_step)
+        logger.logkv("samples", (self.step + 1) * self.global_batch)
+        if self.use_fp16:
+            logger.logkv("lg_loss_scale", self.lg_loss_scale)
+        
+        if self.use_wandb:
+            log_dict = {
+                "step": self.step + self.resume_step,
+                "samples": (self.step + 1) * self.global_batch,
+            }
             if self.use_fp16:
-                logger.logkv("lg_loss_scale", self.lg_loss_scale)
-            
-            if self.use_wandb:
-                log_dict = {
-                    "step": step,
-                    "samples": (step + 1) * self.global_batch,
-                }
-                if self.use_fp16:
-                    log_dict["lg_loss_scale"] = self.lg_loss_scale
-                wandb.log(log_dict, step=step)
+                log_dict["lg_loss_scale"] = self.lg_loss_scale
+            wandb.log(log_dict, step=self.step)
 
     def save(self):
         def save_checkpoint(rate, params):
@@ -377,25 +318,18 @@ class TrainLoop:
                 filename = f"model{(self.step+self.resume_step):06d}.pt"
             else:
                 filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
-            print('save to', bf.join(get_blob_logdir(), filename))
-            print('save to', bf.join(self.checkpoint_path, filename))
-            # with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
-            #     th.save(state_dict, f)
-            with bf.BlobFile(bf.join(self.checkpoint_path, filename), "wb") as f: # DEBUG **
+            with bf.BlobFile(bf.join(self.checkpoint_path, filename), "wb") as f:
                 th.save(state_dict, f)
 
         save_checkpoint(0, self.master_params)
         for rate, params in zip(self.ema_rate, self.ema_params):
             save_checkpoint(rate, params)
 
-        if True: # DEBUG **
-            with bf.BlobFile(
-                bf.join(self.checkpoint_path, f"opt{(self.step+self.resume_step):06d}.pt"),
-                "wb",
-            ) as f:
-                th.save(self.opt.state_dict(), f)
-
-        dist.barrier()
+        with bf.BlobFile(
+            bf.join(self.checkpoint_path, f"opt{(self.step+self.resume_step):06d}.pt"),
+            "wb",
+        ) as f:
+            th.save(self.opt.state_dict(), f)
 
     def _master_params_to_state_dict(self, master_params):
         if self.use_fp16:
@@ -451,22 +385,13 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
     return None
 
 
-def log_loss_dict(diffusion, ts, losses, step=None):
-    log_dict = {}
-    
+def log_loss_dict(diffusion, ts, losses):
     for key, values in losses.items():
-        mean_value = values.mean().item()
-        logger.logkv_mean(key, mean_value)
-        log_dict[key] = mean_value
-        
+        logger.logkv_mean(key, values.mean().item())
         # Log the quantiles (four quartiles, in particular).
         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
-            quartile_key = f"{key}_q{quartile}"
-            logger.logkv_mean(quartile_key, sub_loss)
-            log_dict[quartile_key] = sub_loss
-    
-    # Log to wandb if enabled (only on rank 0)
-    if dist_util.get_rank() == 0 and wandb.run is not None and step is not None:
-        wandb.log(log_dict, step=step)
-
+            logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+            
+        if wandb.run is not None:
+            wandb.log({key: values.mean().item()}) 

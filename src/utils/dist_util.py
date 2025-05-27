@@ -5,18 +5,35 @@ Helpers for distributed training.
 import io
 import os
 import socket
-
-import blobfile as bf
-from mpi4py import MPI
 import torch as th
 import torch.distributed as dist
 
-# Change this to reflect your cluster layout.
-# The GPU for a given rank is (rank % GPUS_PER_NODE).
-GPUS_PER_NODE = 10 #8
+# Change this to reflect your device (CPU or CUDA)
+CUDA_VISIBLE_DEVICES = os.getenv('CUDA_VISIBLE_DEVICES', '')
 
-SETUP_RETRY_COUNT = 3
+def dev():
+    """
+    Get the device to use for torch.distributed.
+    """
+    if th.cuda.is_available():
+        return th.device(f"cuda:{th.cuda.current_device()}")
+    return th.device("cpu")
 
+def load_state_dict(path, **kwargs):
+    """
+    Load a PyTorch file without redundant fetches across MPI ranks.
+    """
+    return th.load(path, **kwargs)
+
+def sync_params(params):
+    """
+    Synchronize parameters across ranks.
+    """
+    if not dist.is_initialized():
+        return
+    for p in params:
+        with th.no_grad():
+            dist.broadcast(p.data, src=0)
 
 def setup_dist():
     """
@@ -25,59 +42,55 @@ def setup_dist():
     if dist.is_initialized():
         return
 
-    comm = MPI.COMM_WORLD
-    backend = "gloo" if not th.cuda.is_available() else "nccl"
-
-    if backend == "gloo":
-        hostname = "localhost"
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
     else:
-        hostname = socket.gethostbyname(socket.getfqdn())
-    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
-    os.environ["RANK"] = str(comm.rank)
-    os.environ["WORLD_SIZE"] = str(comm.size)
+        rank = 0
+        world_size = 1
+        local_rank = 0
 
-
-    port = comm.bcast(_find_free_port(), root=0)
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend=backend, init_method="env://")
-
-
-def dev():
-    """
-    Get the device to use for torch.distributed.
-    """
     if th.cuda.is_available():
-        return th.device(f"cuda:{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}")
-    return th.device("cpu")
+        th.cuda.set_device(local_rank)  # Set device based on local_rank
 
+    if world_size >= 1:
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
+        synchronize()
+    return
 
-def load_state_dict(path, **kwargs):
+def cleanup_dist():
     """
-    Load a PyTorch file without redundant fetches across MPI ranks.
+    Cleanup the distributed environment.
     """
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        with bf.BlobFile(path, "rb") as f:
-            data = f.read()
-    else:
-        data = None
-    data = MPI.COMM_WORLD.bcast(data)
-    return th.load(io.BytesIO(data), **kwargs)
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
-
-def sync_params(params):
+def synchronize():
     """
-    Synchronize a sequence of Tensors across ranks from rank 0.
+    Helper function to synchronize between multiple processes when using distributed training.
     """
-    for p in params:
-        with th.no_grad():
-            dist.broadcast(p, 0)
+    if not dist.is_initialized():
+        return
+    dist.barrier()
 
+def get_rank():
+    """
+    Get the rank of the current process.
+    """
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0
 
-def _find_free_port():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
-    finally:
-        s.close()
+def get_world_size():
+    """
+    Get the world size (total number of processes).
+    """
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1

@@ -152,7 +152,11 @@ def train_word_level_tokenizer(
 
     print(tokenizer.encode("the red.").ids)
 
+    print(tokenizer.encode("the red.").tokens)
+
     print(tokenizer.encode("the red."))
+
+    print("Vocabulary size:", tokenizer.get_vocab_size())
 
     tokenizer.save(f"{str(pathlib.Path(path).parent)}/word-level-vocab.json")
 

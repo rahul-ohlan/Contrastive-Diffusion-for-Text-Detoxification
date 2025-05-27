@@ -1,7 +1,7 @@
 from transformers import AutoConfig
 
 # from transformers import BertEncoder
-from transformers.models.bert.modeling_bert import BertEncoder
+from transformers.models.bert.modeling_bert import BertEncoder, BertLayer
 import torch
 
 import torch as th
@@ -12,6 +12,19 @@ from src.modeling.diffusion.nn import (
     timestep_embedding,
 )
 
+
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.cross_attention = BertLayer(config)
+    
+    def forward(self, hidden_states, condition_states, attention_mask=None):
+        cross_attention_outputs = self.cross_attention(
+            hidden_states,
+            encoder_hidden_states=condition_states,
+            encoder_attention_mask=attention_mask,
+        )
+        return cross_attention_outputs[0]
 
 class TransformerNetModel(nn.Module):
     """
@@ -50,7 +63,8 @@ class TransformerNetModel(nn.Module):
         if config is None:
             config = AutoConfig.from_pretrained(config_name)
             config.hidden_dropout_prob = dropout
-            # config.hidden_size = 512
+            config.is_decoder = True
+            config.add_cross_attention = True
 
         self.in_channels = in_channels
         self.model_channels = model_channels
@@ -76,6 +90,12 @@ class TransformerNetModel(nn.Module):
         self.build_xstart_predictor()
         self.build_input_output_projections()
         self.build_embeddings()
+        
+        # Add cross-attention layers
+        self.cross_attention = CrossAttentionLayer(config)
+        
+        # Condition encoder
+        self.condition_encoder = BertEncoder(config)
 
         self.register_buffer(
             "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
@@ -139,18 +159,22 @@ class TransformerNetModel(nn.Module):
     def get_logits(self, hidden_repr):
         return self.lm_head(hidden_repr)
 
-    def forward(self, x, timesteps, y=None, src_ids=None, src_mask=None, attention_mask=None):
+    def forward(self, x, timesteps, toxic_ids=None, toxic_mask=None, attention_mask=None):
         """
         Apply the model to an input batch.
 
-        :param x: an [N x C x ...] Tensor of inputs.
+        :param x: an [N x C x ...] Tensor of inputs (clean text embeddings).
         :param timesteps: a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
+        :param toxic_ids: input ids of the toxic text condition
+        :param toxic_mask: attention mask for the toxic text
+        :param attention_mask: attention mask for the input
         :return: an [N x C x ...] Tensor of outputs.
         """
 
+        # Time embedding
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
+        # Process input embeddings
         emb_x = self.input_up_proj(x)
         seq_length = x.size(1)
         position_ids = self.position_ids[:, :seq_length]
@@ -161,14 +185,39 @@ class TransformerNetModel(nn.Module):
         )
         emb_inputs = self.dropout(self.LayerNorm(emb_inputs))
 
-        # https://github.com/huggingface/transformers/blob/e95d433d77727a9babadf008dd621a2326d37303/src/transformers/modeling_utils.py#L700
+        # Process condition (toxic text)
+        if toxic_ids is not None:
+            toxic_embeds = self.word_embedding(toxic_ids)
+            toxic_pos_ids = self.position_ids[:, :toxic_ids.size(1)]
+            toxic_inputs = self.position_embeddings(toxic_pos_ids) + toxic_embeds
+            toxic_inputs = self.dropout(self.LayerNorm(toxic_inputs))
+            
+            # Encode toxic condition
+            condition_states = self.condition_encoder(
+                toxic_inputs,
+                attention_mask=toxic_mask[:, None, None, :] if toxic_mask is not None else None
+            ).last_hidden_state
+        else:
+            condition_states = None
+            toxic_mask = None
+
+        # Self-attention on input
         if attention_mask is not None:
             attention_mask = attention_mask[:, None, None, :]
-
-        input_trans_hidden_states = self.input_transformers(
-            emb_inputs, attention_mask=attention_mask
+        
+        hidden_states = self.input_transformers(
+            emb_inputs, 
+            attention_mask=attention_mask
         ).last_hidden_state
 
-        h = self.output_down_proj(input_trans_hidden_states)
+        # Cross-attention with condition
+        if condition_states is not None:
+            hidden_states = self.cross_attention(
+                hidden_states,
+                condition_states,
+                attention_mask=toxic_mask[:, None, None, :] if toxic_mask is not None else None
+            )
+
+        h = self.output_down_proj(hidden_states)
         h = h.type(x.dtype)
         return h

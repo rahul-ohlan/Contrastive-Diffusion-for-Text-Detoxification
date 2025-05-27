@@ -1,22 +1,17 @@
 """
-Train a diffusion model on images.
+Train a diffusion model on images (Single GPU version).
 """
-import torch.multiprocessing as mp
-mp.set_start_method("spawn", force=True)
 
-import json, os
+import json
 import pathlib
-import pprint
-import sys
 import wandb
 from transformers import set_seed
-import os
-from torch.nn.parallel import DistributedDataParallel as DDP   
+import torch
 
-from src.utils import dist_util, logger
+from src.utils import logger
 from src.modeling.diffusion.resample import create_named_schedule_sampler
 from src.train_infer.factory_methods import create_model_and_diffusion
-from src.train_infer.train_loop import TrainLoop
+from src.train_infer.train_loop_single import TrainLoop
 from src.utils import data_utils_sentencepiece
 from src.utils.args_utils import create_argparser, args_to_dict, model_and_diffusion_defaults
 from src.utils.custom_tokenizer import create_tokenizer
@@ -30,17 +25,12 @@ def make_wandb_name_from_args(args):
         name += f"{key}={getattr(args, key)}_"
     return name.rstrip('_')
 
-def setup_wandb(args, is_rank_0):
-    """Setup wandb with DDP support"""
-    if not is_rank_0:
-        # Disable logging for non-master processes
-        os.environ["WANDB_MODE"] = "disabled"
-    
-    # Initialize wandb only if use_wandb is True
+def setup_wandb(args):
+    """Setup wandb"""
     if args.use_wandb:
         wandb_run = wandb.init(
-            project="minimal-text-diffusion",  # Change this to your project name
-            entity="cb-solo",  # Change this to your wandb username or team name
+            project="minimal-text-diffusion",
+            entity="cb-solo",
             name=make_wandb_name_from_args(args),
             config=args.__dict__,
             resume="allow"
@@ -51,17 +41,19 @@ def setup_wandb(args, is_rank_0):
 def main():
     args = create_argparser().parse_args()
     set_seed(args.seed)
-    local_rank = dist_util.setup_dist()
     
-    # Only log on rank 0
-    is_rank_0 = dist_util.get_rank() == 0
-    if is_rank_0:
-        logger.configure()
-        logger.log("creating data loader...")
-        pathlib.Path(args.checkpoint_path).mkdir(parents=True, exist_ok=True)
+    # Configure logging
+    logger.configure()
+    logger.log("creating data loader...")
+    pathlib.Path(args.checkpoint_path).mkdir(parents=True, exist_ok=True)
 
-    tokenizer = create_tokenizer(return_pretokenized=args.use_pretrained_embeddings, path=f"data/{args.dataset}/")
+    # Create tokenizer
+    tokenizer = create_tokenizer(
+        return_pretokenized=args.use_pretrained_embeddings, 
+        path=f"data/{args.dataset}/"
+    )
 
+    # Create dataloaders
     train_dataloader = data_utils_sentencepiece.get_dataloader(
         tokenizer=tokenizer,
         data_path=args.train_txt_path,
@@ -77,42 +69,32 @@ def main():
     )
 
     args.vocab_size = tokenizer.vocab_size
-
-    if is_rank_0:
-        logger.log("creating model and diffusion...")
-        # Initialize wandb
-        wandb_run = setup_wandb(args, is_rank_0)
+    logger.log("creating model and diffusion...")
+    
+    # Initialize wandb
+    wandb_run = setup_wandb(args)
 
     try:
+        # Create model and diffusion
         model, diffusion = create_model_and_diffusion(
             **args_to_dict(args, model_and_diffusion_defaults().keys())
         )
-        model.to(dist_util.dev())
-
-        if dist_util.get_world_size() > 1:
-            model = DDP(
-                model, 
-                device_ids=[local_rank],
-                output_device=local_rank,
-                find_unused_parameters=False,
-                broadcast_buffers=True
-            )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
             
-        if is_rank_0 and args.use_wandb:
+        if args.use_wandb:
             print(model)
             pytorch_total_params = sum(p.numel() for p in model.parameters())
             logger.log(f"the parameter count is {pytorch_total_params}")
             wandb.log({"total_parameters": pytorch_total_params})
             
-            # Save hyperparameters
-            logger.log(f"saving the hyperparameters to {args.checkpoint_path}/training_args.json")
-            with open(f"{args.checkpoint_path}/training_args.json", "w") as f:
-                json.dump(args.__dict__, f, indent=2)
+        # Save hyperparameters
+        logger.log(f"saving the hyperparameters to {args.checkpoint_path}/training_args.json")
+        with open(f"{args.checkpoint_path}/training_args.json", "w") as f:
+            json.dump(args.__dict__, f, indent=2)
 
         schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
-
-        if is_rank_0:
-            logger.log("training...")
+        logger.log("training...")
 
         # Initialize training loop
         TrainLoop(
@@ -135,20 +117,16 @@ def main():
             gradient_clipping=args.gradient_clipping,
             eval_data=val_dataloader,
             eval_interval=args.eval_interval,
-            use_wandb=args.use_wandb,  # Use the argument value instead of hardcoding
+            use_wandb=args.use_wandb,
         ).run_loop()
 
     except Exception as e:
-        if is_rank_0:
-            logger.log(f"Error during training: {str(e)}")
+        logger.log(f"Error during training: {str(e)}")
         raise e
     finally:
-        # Cleanup
-        if is_rank_0 and args.use_wandb:
+        if args.use_wandb:
             wandb.finish()
-        if dist_util.get_world_size() > 1:
-            dist_util.cleanup_dist()
 
 
 if __name__ == "__main__":
-    main()
+    main() 

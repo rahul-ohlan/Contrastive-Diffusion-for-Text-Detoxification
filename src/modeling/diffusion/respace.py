@@ -129,3 +129,15 @@ class _WrappedModel:
         # return temp
         # print(new_ts)
         return self.model(x, new_ts, **kwargs)
+        
+    def get_embeds(self, input_ids):
+        """Delegate to the underlying model's get_embeds method."""
+        if hasattr(self.model, 'module'):
+            return self.model.module.get_embeds(input_ids)
+        return self.model.get_embeds(input_ids)
+        
+    def get_logits(self, hidden_repr):
+        """Delegate to the underlying model's get_logits method."""
+        if hasattr(self.model, 'module'):
+            return self.model.module.get_logits(hidden_repr)
+        return self.model.get_logits(hidden_repr)
