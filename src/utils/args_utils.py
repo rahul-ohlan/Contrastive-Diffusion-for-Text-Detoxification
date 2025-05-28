@@ -65,13 +65,13 @@ def model_and_diffusion_defaults():
     """
     return dict(
         sequence_len=64,
-        num_channels=16,
-        num_heads=4,
-        dropout=0.0,
+        num_channels=256,  # Reduced from 512 to 256
+        num_heads=4,       # Reduced from 8 to 4
+        dropout=0.1,
         learn_sigma=False,
         sigma_small=False,
         class_cond=False,
-        diffusion_steps=10000,
+        diffusion_steps=1000,
         noise_schedule="linear",
         timestep_respacing="",
         use_kl=False,
@@ -80,8 +80,8 @@ def model_and_diffusion_defaults():
         rescale_learned_sigmas=True,
         use_checkpoint=False,
         model_arch="transformer",
-        in_channel=16,
-        out_channel=16,
+        in_channel=768,  # BERT embedding dimension
+        out_channel=768,  # BERT embedding dimension
         vocab_size=66,
         config_name="bert-base-uncased",
         logits_mode=1,

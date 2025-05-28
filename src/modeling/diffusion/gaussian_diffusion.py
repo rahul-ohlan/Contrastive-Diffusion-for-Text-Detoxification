@@ -228,12 +228,12 @@ class GaussianDiffusion:
         self.training_mode = training_mode
         print("training mode is ", training_mode)
 
-    def training_losses(self, model, x_start_never_used, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
 
         :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs. It is NEVER used -- the embeddings are recreated every time from the input IDs.
+        :param x_start: the [N x C x ...] tensor of clean embeddings
         :param t: a batch of timestep indices.
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
@@ -241,67 +241,28 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
-        assert "input_ids" in model_kwargs
-        input_ids = model_kwargs.pop("input_ids").to(t.device)
-        
-        # Get the underlying model from DDP wrapper if needed
-        if hasattr(model, 'module'):
-            base_model = model.module
-        else:
-            base_model = model
-            
-        x_start_mean = base_model.get_embeds(input_ids)
-
-        std = _extract_into_tensor(
-            self.sqrt_one_minus_alphas_cumprod,
-            th.tensor([0]).to(x_start_mean.device),
-            x_start_mean.shape,
-        )
-
-        x_start = self.get_x_start(x_start_mean, std)
-        # print(x_start_mean.shape, x_start.shape)
         if noise is None:
             noise = th.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise=noise)  # reparametrization trick.
-        get_logits = base_model.get_logits  # Use base_model here too
+        
+        # Add noise to clean embeddings
+        x_t = self.q_sample(x_start, t, noise=noise)
 
-        terms = {}
-
+        # Get model's prediction
         model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
-        # for the noisy inputs, the models returns the hidden states that are predictions of x_start
-
+        # Determine target based on model_mean_type
         target = {
-            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[
-                0
-            ],
-            ModelMeanType.START_X: x_start,  # THIS is actually used
+            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[0],
+            ModelMeanType.START_X: x_start,
             ModelMeanType.EPSILON: noise,
         }[self.model_mean_type]
-        assert (
-            model_output.shape == target.shape == x_start.shape
-        ), f"model_output.shape: {model_output.shape}, target.shape: {target.shape}, x_start.shape: {x_start.shape}"
-        # the usual diffusion loss
+
+        assert model_output.shape == target.shape == x_start.shape
+
+        # Compute MSE loss
+        terms = {}
         terms["mse"] = mean_flat((target - model_output) ** 2)
-        # print( terms["mse"])
-        model_out_x_start = self.x0_helper(model_output, x_t, t)["pred_xstart"]
-        t0_mask = t == 0
-
-        # The embedding loss!
-        t0_loss = mean_flat((x_start_mean - model_out_x_start) ** 2)
-        # print(terms["mse"].shape, )
-        terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
-
-        # tT_mask = (t == self.num_timesteps - 1)
-        out_mean, _, _ = self.q_mean_variance(
-            x_start, th.LongTensor([self.num_timesteps - 1]).to(x_start.device)
-        )
-        tT_loss = mean_flat(out_mean**2)
-
-        # The rounding loss
-        decoder_nll = self.token_discrete_loss(x_start, get_logits, input_ids)
-
-        terms["loss"] = terms["mse"] + (decoder_nll + tT_loss)
+        terms["loss"] = terms["mse"]
 
         return terms
 
